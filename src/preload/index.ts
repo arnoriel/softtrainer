@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { ModuleSource } from './index.d'
+import type { ModuleSource } from './types'
 
 const brewAPI = {
   list:           ()                                                                         => ipcRenderer.invoke('brew:list'),
@@ -17,7 +17,11 @@ const brewAPI = {
   clearLogs:      ()                                                                         => ipcRenderer.invoke('logs:clear'),
   getSystemTheme: ()                                                                         => ipcRenderer.invoke('theme:get-system'),
   // Git updater
-  checkUpdates:   ()                                                                         => ipcRenderer.invoke('updater:check'),
+  checkUpdates:         ()                    => ipcRenderer.invoke('updater:check'),
+  downloadAndInstall:   (latestCommit: string) => ipcRenderer.invoke('updater:download-install', latestCommit),
+  restartApp:           ()                    => ipcRenderer.invoke('updater:restart'),
+  onUpdateProgress:     (cb: (data: { phase: string; pct: number }) => void) => ipcRenderer.on('updater:progress', (_, data) => cb(data)),
+  offUpdateProgress:    ()                    => ipcRenderer.removeAllListeners('updater:progress'),
 }
 
 contextBridge.exposeInMainWorld('brew', brewAPI)

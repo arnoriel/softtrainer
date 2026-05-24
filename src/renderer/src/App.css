@@ -1547,3 +1547,107 @@ body {
   padding: 1px 6px;
   letter-spacing: 0.04em;
 }
+
+/* Install button */
+.btn-updater-install {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 7px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font);
+  color: #fff;
+  background: var(--amber, #f59e0b);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: opacity 0.15s;
+  width: 100%;
+  justify-content: center;
+}
+.btn-updater-install:hover { opacity: 0.87; }
+
+/* Install error */
+.updater-install-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red) 25%, transparent);
+  border-radius: var(--radius-sm);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+/* Progress */
+.updater-progress-wrap {
+  margin-top: 14px;
+  padding: 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+}
+.updater-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.updater-progress-phase {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+.updater-progress-pct {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+.updater-progress-track {
+  height: 5px;
+  background: var(--border-light);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.updater-progress-bar {
+  height: 100%;
+  background: var(--amber, #f59e0b);
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+.updater-progress-hint {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+/* Restart */
+.updater-restart-wrap {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.btn-updater-restart {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 9px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font);
+  color: #fff;
+  background: var(--green, #22c55e);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.btn-updater-restart:hover { opacity: 0.87; }

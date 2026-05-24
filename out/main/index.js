@@ -5,6 +5,8 @@ const child_process = require("child_process");
 const util = require("util");
 const fs = require("fs");
 const https = require("https");
+const http = require("http");
+const os = require("os");
 const execAsync = util.promisify(child_process.exec);
 function getBrewPath() {
   const paths = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"];
@@ -678,6 +680,126 @@ async function checkForUpdates() {
     return { hasUpdate: false, currentVersion: "", latestCommit: "", commitDate: "", checkedAt, error: String(e) };
   }
 }
+function sendProgress(phase, pct) {
+  electron.BrowserWindow.getAllWindows()[0]?.webContents.send("updater:progress", { phase, pct });
+}
+function fetchGitHubRelease(repo) {
+  return new Promise((resolve, reject) => {
+    const url = `https://api.github.com/repos/${repo}/releases/latest`;
+    const req = https.get(url, { headers: { "User-Agent": "soft-trainer-app" } }, (res) => {
+      let body = "";
+      res.on("data", (c) => {
+        body += c;
+      });
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(body);
+          if (json.message) return reject(new Error(`GitHub Releases API: ${json.message}`));
+          resolve(json.assets ?? []);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(15e3, () => req.destroy(new Error("Request timed out")));
+  });
+}
+function downloadFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const follow = (currentUrl, redirects = 0) => {
+      if (redirects > 10) return reject(new Error("Too many redirects"));
+      const mod = currentUrl.startsWith("https") ? https : http;
+      const req = mod.get(currentUrl, { headers: { "User-Agent": "soft-trainer-app" } }, (res) => {
+        if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) {
+          if (res.headers.location) return follow(res.headers.location, redirects + 1);
+          return reject(new Error("Redirect with no location"));
+        }
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+        const total = parseInt(res.headers["content-length"] ?? "0", 10);
+        let downloaded = 0;
+        const file = fs.createWriteStream(destPath);
+        res.on("data", (chunk) => {
+          downloaded += chunk.length;
+          file.write(chunk);
+          if (total > 0) sendProgress("Downloading", Math.round(downloaded / total * 90));
+        });
+        res.on("end", () => {
+          file.end();
+          file.on("finish", resolve);
+          file.on("error", reject);
+        });
+        res.on("error", (e) => {
+          file.destroy();
+          reject(e);
+        });
+      });
+      req.on("error", reject);
+      req.setTimeout(12e4, () => req.destroy(new Error("Download timed out")));
+    };
+    follow(url);
+  });
+}
+function getAppInstallPath() {
+  const match = process.execPath.match(/^(.*\.app)\//);
+  if (match) return match[1];
+  return null;
+}
+async function downloadAndInstall(latestCommit) {
+  const dmgPath = path.join(os.tmpdir(), `soft-trainer-update-${Date.now()}.dmg`);
+  let mountPoint = null;
+  try {
+    sendProgress("Fetching release info", 5);
+    const assets = await fetchGitHubRelease(GITHUB_REPO);
+    const arch = process.arch;
+    const asset = assets.find(
+      (a) => a.name.endsWith(".dmg") && a.name.includes(arch)
+    ) ?? assets.find((a) => a.name.endsWith(".dmg"));
+    if (!asset) throw new Error("No DMG asset found in latest GitHub Release. Make sure you have uploaded a .dmg to the release.");
+    sendProgress("Downloading", 10);
+    await downloadFile(asset.browser_download_url, dmgPath);
+    sendProgress("Mounting DMG", 91);
+    const { stdout: attachOut } = await runCmd(`hdiutil attach -nobrowse -quiet "${dmgPath}"`, { timeout: 3e4 });
+    const lines = attachOut.trim().split("\n").filter(Boolean);
+    const lastLine = lines[lines.length - 1];
+    mountPoint = lastLine.split("	").pop()?.trim() ?? null;
+    if (!mountPoint) throw new Error("Could not determine DMG mount point");
+    sendProgress("Installing", 94);
+    const { stdout: findOut } = await runCmd(`find "${mountPoint}" -maxdepth 1 -name "*.app"`, { timeout: 5e3 });
+    const sourceApp = findOut.trim().split("\n")[0];
+    if (!sourceApp) throw new Error("No .app found inside DMG");
+    const installTarget = getAppInstallPath();
+    const destDir = installTarget ? path.dirname(installTarget) : "/Applications";
+    const appName = sourceApp.split("/").pop();
+    const destApp = path.join(destDir, appName);
+    await runCmd(`cp -R "${sourceApp}" "${destApp}"`, { timeout: 3e4 });
+    sendProgress("Cleaning up", 98);
+    await runCmd(`hdiutil detach "${mountPoint}" -quiet`, { timeout: 15e3 });
+    mountPoint = null;
+    try {
+      fs.unlinkSync(dmgPath);
+    } catch {
+    }
+    writeUpdateState({ lastKnownCommit: latestCommit });
+    sendProgress("Done", 100);
+    appendLog({ level: "info", action: "auto-update", target: "app", message: `Updated to ${latestCommit.slice(0, 7)}` });
+    return { success: true };
+  } catch (e) {
+    const msg = String(e);
+    if (mountPoint) {
+      try {
+        await runCmd(`hdiutil detach "${mountPoint}" -quiet`, { timeout: 1e4 });
+      } catch {
+      }
+    }
+    try {
+      if (fs.existsSync(dmgPath)) fs.unlinkSync(dmgPath);
+    } catch {
+    }
+    appendLog({ level: "error", action: "auto-update", target: "app", message: "Auto-update failed", details: msg });
+    return { success: false, error: msg };
+  }
+}
 function createWindow() {
   const win = new electron.BrowserWindow({
     width: 980,
@@ -852,6 +974,13 @@ electron.app.whenReady().then(() => {
   });
   electron.ipcMain.handle("updater:check", async () => {
     return checkForUpdates();
+  });
+  electron.ipcMain.handle("updater:download-install", async (_, latestCommit) => {
+    return downloadAndInstall(latestCommit);
+  });
+  electron.ipcMain.handle("updater:restart", () => {
+    electron.app.relaunch();
+    electron.app.exit(0);
   });
   createWindow();
   electron.app.on("activate", () => {

@@ -1,4 +1,4 @@
-import { SoftTool } from '../../../preload/index.d'
+import { SoftTool } from '../../../preload/types'
 
 const TOOL_COLORS: Record<string, string> = {
   homebrew:  '#f9a825',

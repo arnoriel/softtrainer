@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { LogEntry } from '../../../preload/index.d'
+import { LogEntry } from '../../../preload/types'
 
 interface Props {
   logs: LogEntry[]

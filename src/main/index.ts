@@ -1,9 +1,11 @@
 import { app, shell, BrowserWindow, ipcMain, nativeTheme } from 'electron'
-import { join } from 'path'
+import { join, dirname } from 'path'
 import { exec } from 'child_process'
 import { promisify } from 'util'
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, createWriteStream, unlinkSync } from 'fs'
 import https from 'https'
+import http from 'http'
+import { tmpdir } from 'os'
 
 const execAsync = promisify(exec)
 
@@ -784,6 +786,138 @@ async function checkForUpdates(): Promise<{
   }
 }
 
+// ── Auto-update: download & install DMG ──────────────────────────────────────
+
+function sendProgress(phase: string, pct: number): void {
+  BrowserWindow.getAllWindows()[0]?.webContents.send('updater:progress', { phase, pct })
+}
+
+function fetchGitHubRelease(repo: string): Promise<Array<{ name: string; browser_download_url: string }>> {
+  return new Promise((resolve, reject) => {
+    const url = `https://api.github.com/repos/${repo}/releases/latest`
+    const req = https.get(url, { headers: { 'User-Agent': 'soft-trainer-app' } }, (res) => {
+      let body = ''
+      res.on('data', (c) => { body += c })
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(body)
+          if (json.message) return reject(new Error(`GitHub Releases API: ${json.message}`))
+          resolve((json.assets ?? []) as Array<{ name: string; browser_download_url: string }>)
+        } catch (e) { reject(e) }
+      })
+    })
+    req.on('error', reject)
+    req.setTimeout(15000, () => req.destroy(new Error('Request timed out')))
+  })
+}
+
+function downloadFile(url: string, destPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const follow = (currentUrl: string, redirects = 0) => {
+      if (redirects > 10) return reject(new Error('Too many redirects'))
+      const mod = currentUrl.startsWith('https') ? https : http
+      const req = (mod as typeof https).get(currentUrl, { headers: { 'User-Agent': 'soft-trainer-app' } }, (res) => {
+        if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) {
+          if (res.headers.location) return follow(res.headers.location, redirects + 1)
+          return reject(new Error('Redirect with no location'))
+        }
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`))
+
+        const total = parseInt(res.headers['content-length'] ?? '0', 10)
+        let downloaded = 0
+        const file = createWriteStream(destPath)
+
+        res.on('data', (chunk: Buffer) => {
+          downloaded += chunk.length
+          file.write(chunk)
+          if (total > 0) sendProgress('Downloading', Math.round((downloaded / total) * 90))
+        })
+        res.on('end', () => {
+          file.end()
+          file.on('finish', resolve)
+          file.on('error', reject)
+        })
+        res.on('error', (e) => { file.destroy(); reject(e) })
+      })
+      req.on('error', reject)
+      req.setTimeout(120000, () => req.destroy(new Error('Download timed out')))
+    }
+    follow(url)
+  })
+}
+
+function getAppInstallPath(): string | null {
+  // In packaged app: process.execPath = /Applications/soft-trainer.app/Contents/MacOS/soft-trainer
+  // Walk up to find the .app bundle
+  const match = process.execPath.match(/^(.*\.app)\//)
+  if (match) return match[1]
+  return null
+}
+
+async function downloadAndInstall(latestCommit: string): Promise<{ success: boolean; error?: string }> {
+  const dmgPath = join(tmpdir(), `soft-trainer-update-${Date.now()}.dmg`)
+  let mountPoint: string | null = null
+
+  try {
+    sendProgress('Fetching release info', 5)
+
+    const assets = await fetchGitHubRelease(GITHUB_REPO)
+    const arch = process.arch // 'arm64' or 'x64'
+    const asset = assets.find((a) =>
+      a.name.endsWith('.dmg') && a.name.includes(arch)
+    ) ?? assets.find((a) => a.name.endsWith('.dmg'))
+
+    if (!asset) throw new Error('No DMG asset found in latest GitHub Release. Make sure you have uploaded a .dmg to the release.')
+
+    sendProgress('Downloading', 10)
+    await downloadFile(asset.browser_download_url, dmgPath)
+
+    sendProgress('Mounting DMG', 91)
+    const { stdout: attachOut } = await runCmd(`hdiutil attach -nobrowse -quiet "${dmgPath}"`, { timeout: 30000 })
+    // Parse mount point — last tab-delimited field of last line
+    const lines = attachOut.trim().split('\n').filter(Boolean)
+    const lastLine = lines[lines.length - 1]
+    mountPoint = lastLine.split('\t').pop()?.trim() ?? null
+    if (!mountPoint) throw new Error('Could not determine DMG mount point')
+
+    sendProgress('Installing', 94)
+    // Find the .app inside the mounted DMG
+    const { stdout: findOut } = await runCmd(`find "${mountPoint}" -maxdepth 1 -name "*.app"`, { timeout: 5000 })
+    const sourceApp = findOut.trim().split('\n')[0]
+    if (!sourceApp) throw new Error('No .app found inside DMG')
+
+    // Determine where to install
+    const installTarget = getAppInstallPath()
+    const destDir = installTarget ? dirname(installTarget) : '/Applications'
+    const appName = sourceApp.split('/').pop()!
+    const destApp = join(destDir, appName)
+
+    await runCmd(`cp -R "${sourceApp}" "${destApp}"`, { timeout: 30000 })
+
+    sendProgress('Cleaning up', 98)
+    await runCmd(`hdiutil detach "${mountPoint}" -quiet`, { timeout: 15000 })
+    mountPoint = null
+    try { unlinkSync(dmgPath) } catch {}
+
+    // Save new commit as acknowledged so after restart it shows "Up To Date"
+    writeUpdateState({ lastKnownCommit: latestCommit })
+
+    sendProgress('Done', 100)
+    appendLog({ level: 'info', action: 'auto-update', target: 'app', message: `Updated to ${latestCommit.slice(0, 7)}` })
+    return { success: true }
+
+  } catch (e) {
+    const msg = String(e)
+    // Cleanup on error
+    if (mountPoint) {
+      try { await runCmd(`hdiutil detach "${mountPoint}" -quiet`, { timeout: 10000 }) } catch {}
+    }
+    try { if (existsSync(dmgPath)) unlinkSync(dmgPath) } catch {}
+    appendLog({ level: 'error', action: 'auto-update', target: 'app', message: 'Auto-update failed', details: msg })
+    return { success: false, error: msg }
+  }
+}
+
 // ── Window ────────────────────────────────────────────────────────────────────
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -979,6 +1113,15 @@ app.whenReady().then(() => {
   // ── Git Updater IPC ──────────────────────────────────────────────────────────
   ipcMain.handle('updater:check', async () => {
     return checkForUpdates()
+  })
+
+  ipcMain.handle('updater:download-install', async (_, latestCommit: string) => {
+    return downloadAndInstall(latestCommit)
+  })
+
+  ipcMain.handle('updater:restart', () => {
+    app.relaunch()
+    app.exit(0)
   })
 
   createWindow()

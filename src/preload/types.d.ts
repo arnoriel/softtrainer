@@ -63,7 +63,11 @@ export interface BrewAPI {
   clearLogs:      ()                                                                          => Promise<{ success: boolean }>
   getSystemTheme: ()                                                                          => Promise<{ isDark: boolean }>
   // Git updater
-  checkUpdates:   ()                                                                          => Promise<UpdateInfo>
+  checkUpdates:         ()                     => Promise<UpdateInfo>
+  downloadAndInstall:   (latestCommit: string) => Promise<{ success: boolean; error?: string }>
+  restartApp:           ()                     => Promise<void>
+  onUpdateProgress:     (cb: (data: { phase: string; pct: number }) => void) => void
+  offUpdateProgress:    ()                     => void
 }
 
 declare global {

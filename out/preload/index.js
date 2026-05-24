@@ -16,6 +16,10 @@ const brewAPI = {
   clearLogs: () => electron.ipcRenderer.invoke("logs:clear"),
   getSystemTheme: () => electron.ipcRenderer.invoke("theme:get-system"),
   // Git updater
-  checkUpdates: () => electron.ipcRenderer.invoke("updater:check")
+  checkUpdates: () => electron.ipcRenderer.invoke("updater:check"),
+  downloadAndInstall: (latestCommit) => electron.ipcRenderer.invoke("updater:download-install", latestCommit),
+  restartApp: () => electron.ipcRenderer.invoke("updater:restart"),
+  onUpdateProgress: (cb) => electron.ipcRenderer.on("updater:progress", (_, data) => cb(data)),
+  offUpdateProgress: () => electron.ipcRenderer.removeAllListeners("updater:progress")
 };
 electron.contextBridge.exposeInMainWorld("brew", brewAPI);

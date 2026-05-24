@@ -1,4 +1,4 @@
-import { SoftModule } from '../../../preload/index.d'
+import { SoftModule } from '../../../preload/types'
 
 interface Props {
   module: SoftModule

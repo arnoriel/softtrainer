@@ -7,7 +7,7 @@ import ToolCard from './components/ToolCard'
 import LogsPanel from './components/LogsPanel'
 import InstallPanel from './components/InstallPanel'
 import Toast from './components/Toast'
-import { SoftModule, SoftTool, LogEntry, UpdateInfo } from '../../preload/index.d'
+import { SoftModule, SoftTool, LogEntry, UpdateInfo } from '../../preload/types'
 
 export type Theme = 'light' | 'dark' | 'system'
 export type ServiceStatus = 'started' | 'stopped' | 'none' | 'error' | 'unknown'
@@ -122,15 +122,45 @@ interface UpdaterModalProps {
 }
 
 function UpdaterModal({ onClose }: UpdaterModalProps) {
-  const [checking, setChecking] = useState(false)
-  const [result,   setResult]   = useState<UpdateInfo | null>(null)
+  const [checking,     setChecking]     = useState(false)
+  const [result,       setResult]       = useState<UpdateInfo | null>(null)
+  const [installing,   setInstalling]   = useState(false)
+  const [installPct,   setInstallPct]   = useState(0)
+  const [installPhase, setInstallPhase] = useState('')
+  const [installDone,  setInstallDone]  = useState(false)
+  const [installError, setInstallError] = useState<string | null>(null)
+
+  useEffect(() => {
+    window.brew.onUpdateProgress(({ phase, pct }) => {
+      setInstallPhase(phase)
+      setInstallPct(pct)
+    })
+    return () => { window.brew.offUpdateProgress() }
+  }, [])
 
   const handleCheck = async () => {
     setChecking(true)
     setResult(null)
+    setInstallDone(false)
+    setInstallError(null)
     const info = await window.brew.checkUpdates()
     setResult(info)
     setChecking(false)
+  }
+
+  const handleInstall = async () => {
+    if (!result) return
+    setInstalling(true)
+    setInstallPct(0)
+    setInstallPhase('Preparing')
+    setInstallError(null)
+    const res = await window.brew.downloadAndInstall(result.latestCommit)
+    setInstalling(false)
+    if (res.success) {
+      setInstallDone(true)
+    } else {
+      setInstallError(res.error ?? 'Unknown error')
+    }
   }
 
   const formatDate = (iso: string) => {
@@ -146,7 +176,7 @@ function UpdaterModal({ onClose }: UpdaterModalProps) {
   }
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" onClick={installing ? undefined : onClose}>
       <div className="modal updater-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <div className="modal-title">
@@ -155,24 +185,29 @@ function UpdaterModal({ onClose }: UpdaterModalProps) {
             </svg>
             App Updater
           </div>
-          <button className="modal-close" onClick={onClose}>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
-          </button>
+          {!installing && (
+            <button className="modal-close" onClick={onClose}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          )}
         </div>
 
         <p className="modal-desc">
           Cek apakah ada versi terbaru dari repository resmi soft-trainer.
         </p>
 
-        <div className="updater-actions">
-          <button className="btn-updater-check" onClick={handleCheck} disabled={checking}>
-            {checking ? <><div className="spinner sm" /> Checking…</> : 'Check for updates'}
-          </button>
-        </div>
+        {!installing && !installDone && (
+          <div className="updater-actions">
+            <button className="btn-updater-check" onClick={handleCheck} disabled={checking}>
+              {checking ? <><div className="spinner sm" /> Checking…</> : 'Check for updates'}
+            </button>
+          </div>
+        )}
 
-        {result && (
+        {/* ── Check result ── */}
+        {result && !installing && !installDone && (
           <div className={`updater-result ${result.hasUpdate ? 'has-update' : result.error ? 'has-error' : 'up-to-date'}`}>
             {result.error ? (
               <div className="updater-result-msg">
@@ -193,6 +228,18 @@ function UpdaterModal({ onClose }: UpdaterModalProps) {
                   <span className="updater-meta-label">Latest commit</span>
                   <span className="updater-meta-value updater-commit-sha">{result.latestCommit.slice(0, 7)}</span>
                 </div>
+                {installError && (
+                  <div className="updater-install-error">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                    {installError}
+                  </div>
+                )}
+                <button className="btn-updater-install" onClick={handleInstall}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                  </svg>
+                  Update Now
+                </button>
               </>
             ) : (
               <>
@@ -210,6 +257,38 @@ function UpdaterModal({ onClose }: UpdaterModalProps) {
                 </div>
               </>
             )}
+          </div>
+        )}
+
+        {/* ── Installing: progress bar ── */}
+        {installing && (
+          <div className="updater-progress-wrap">
+            <div className="updater-progress-header">
+              <span className="updater-progress-phase">{installPhase}…</span>
+              <span className="updater-progress-pct">{installPct}%</span>
+            </div>
+            <div className="updater-progress-track">
+              <div className="updater-progress-bar" style={{ width: `${installPct}%` }} />
+            </div>
+            <p className="updater-progress-hint">Jangan tutup aplikasi selama proses update.</p>
+          </div>
+        )}
+
+        {/* ── Install done: tap to restart ── */}
+        {installDone && (
+          <div className="updater-restart-wrap">
+            <div className="updater-result up-to-date">
+              <div className="updater-result-msg">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+                Update installed successfully
+              </div>
+            </div>
+            <button className="btn-updater-restart" onClick={() => window.brew.restartApp()}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>
+              </svg>
+              Tap to Restart App
+            </button>
           </div>
         )}
       </div>
