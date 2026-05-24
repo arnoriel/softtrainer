@@ -877,8 +877,8 @@ async function downloadAndInstall(latestCommit: string): Promise<{ success: bool
     // Parse mount point — last tab-delimited field of last line
     const lines = attachOut.trim().split('\n').filter(Boolean)
     const lastLine = lines[lines.length - 1]
+    if (!lastLine) throw new Error('hdiutil attach returned no output — DMG may be corrupted or already mounted')
     mountPoint = lastLine.split('\t').pop()?.trim() ?? null
-    if (!mountPoint) throw new Error('Could not determine DMG mount point')
 
     sendProgress('Installing', 94)
     // Find the .app inside the mounted DMG
