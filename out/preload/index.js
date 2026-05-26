@@ -20,6 +20,18 @@ const brewAPI = {
   downloadAndInstall: (latestCommit) => electron.ipcRenderer.invoke("updater:download-install", latestCommit),
   restartApp: () => electron.ipcRenderer.invoke("updater:restart"),
   onUpdateProgress: (cb) => electron.ipcRenderer.on("updater:progress", (_, data) => cb(data)),
-  offUpdateProgress: () => electron.ipcRenderer.removeAllListeners("updater:progress")
+  offUpdateProgress: () => electron.ipcRenderer.removeAllListeners("updater:progress"),
+  // Projects
+  selectProjectFolder: () => electron.ipcRenderer.invoke("projects:select-folder"),
+  listProjectItems: (dir) => electron.ipcRenderer.invoke("projects:list", dir),
+  deleteProject: (path) => electron.ipcRenderer.invoke("projects:delete", path),
+  duplicateProject: (path) => electron.ipcRenderer.invoke("projects:duplicate", path),
+  openInVSCode: (path) => electron.ipcRenderer.invoke("projects:open-vscode", path),
+  createProjectFolder: (dir, name) => electron.ipcRenderer.invoke("projects:create-folder", dir, name),
+  unzipProject: (path) => electron.ipcRenderer.invoke("projects:unzip", path),
+  detectTools: () => electron.ipcRenderer.invoke("projects:detect-tools"),
+  initProject: (opts) => electron.ipcRenderer.invoke("projects:init", opts),
+  onProjectInitOutput: (cb) => electron.ipcRenderer.on("project:output", (_, line) => cb(line)),
+  offProjectInitOutput: () => electron.ipcRenderer.removeAllListeners("project:output")
 };
 electron.contextBridge.exposeInMainWorld("brew", brewAPI);

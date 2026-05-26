@@ -22,6 +22,18 @@ const brewAPI = {
   restartApp:           ()                    => ipcRenderer.invoke('updater:restart'),
   onUpdateProgress:     (cb: (data: { phase: string; pct: number }) => void) => ipcRenderer.on('updater:progress', (_, data) => cb(data)),
   offUpdateProgress:    ()                    => ipcRenderer.removeAllListeners('updater:progress'),
+  // Projects
+  selectProjectFolder:  ()                                                           => ipcRenderer.invoke('projects:select-folder'),
+  listProjectItems:     (dir: string)                                                => ipcRenderer.invoke('projects:list', dir),
+  deleteProject:        (path: string)                                               => ipcRenderer.invoke('projects:delete', path),
+  duplicateProject:     (path: string)                                               => ipcRenderer.invoke('projects:duplicate', path),
+  openInVSCode:         (path: string)                                               => ipcRenderer.invoke('projects:open-vscode', path),
+  createProjectFolder:  (dir: string, name: string)                                  => ipcRenderer.invoke('projects:create-folder', dir, name),
+  unzipProject:         (path: string)                                               => ipcRenderer.invoke('projects:unzip', path),
+  detectTools:          ()                                                           => ipcRenderer.invoke('projects:detect-tools'),
+  initProject:          (opts: { frameworkId: string; projectName: string; targetDir: string; settings: Record<string, any> }) => ipcRenderer.invoke('projects:init', opts),
+  onProjectInitOutput:  (cb: (line: string) => void)                                => ipcRenderer.on('project:output', (_, line) => cb(line)),
+  offProjectInitOutput: ()                                                           => ipcRenderer.removeAllListeners('project:output'),
 }
 
 contextBridge.exposeInMainWorld('brew', brewAPI)

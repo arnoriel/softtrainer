@@ -8,20 +8,20 @@ const https = require("https");
 const http = require("http");
 const os = require("os");
 const execAsync = util.promisify(child_process.exec);
-function getBrewPath() {
-  const paths = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"];
-  return paths.find((p) => fs.existsSync(p)) ?? "brew";
+function findExisting(paths, fallback) {
+  return paths.find((p) => fs.existsSync(p)) ?? fallback;
 }
-const BREW = getBrewPath();
+const BREW = findExisting(["/opt/homebrew/bin/brew", "/usr/local/bin/brew"], "brew");
 const BREW_PREFIX = BREW.replace("/bin/brew", "");
-function getPyenvPath() {
-  const home = process.env.HOME ?? "";
-  const paths = [`${home}/.pyenv/bin/pyenv`, "/opt/homebrew/bin/pyenv", "/usr/local/bin/pyenv"];
-  return paths.find((p) => fs.existsSync(p)) ?? "pyenv";
-}
-const PYENV = getPyenvPath();
-function buildPath() {
-  const base = process.env.PATH ?? "";
+const PYENV = findExisting(
+  [
+    `${process.env.HOME ?? ""}/.pyenv/bin/pyenv`,
+    "/opt/homebrew/bin/pyenv",
+    "/usr/local/bin/pyenv"
+  ],
+  "pyenv"
+);
+const BUILT_PATH = (() => {
   const home = process.env.HOME ?? "";
   const extras = [
     `${BREW_PREFIX}/bin`,
@@ -39,55 +39,64 @@ function buildPath() {
     `${BREW_PREFIX}/opt/python@3.11/bin`,
     `${BREW_PREFIX}/opt/python@3.10/bin`
   ];
-  const all = [...extras, ...base.split(":")].filter(Boolean);
+  const all = [...extras, ...(process.env.PATH ?? "").split(":")].filter(Boolean);
   const seen = /* @__PURE__ */ new Set();
-  return all.filter((p) => {
-    if (seen.has(p)) return false;
-    seen.add(p);
-    return true;
-  }).join(":");
-}
+  return all.filter((p) => !seen.has(p) && seen.add(p)).join(":");
+})();
+const RUN_ENV = { ...process.env, PATH: BUILT_PATH };
 async function runCmd(cmd, opts = {}) {
-  return execAsync(cmd, {
-    timeout: opts.timeout ?? 1e4,
-    env: { ...process.env, PATH: buildPath() }
-  });
+  return execAsync(cmd, { timeout: opts.timeout ?? 1e4, env: RUN_ENV });
 }
 const LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1e3;
-function getLogPath() {
-  return path.join(electron.app.getPath("userData"), "soft-trainer-logs.json");
+const LOG_FLUSH_DELAY_MS = 2e3;
+let LOG_PATH = "";
+let UPDATE_STATE_PATH = "";
+let logCache = null;
+let logFlushTimer = null;
+function initLogPath() {
+  const userData = electron.app.getPath("userData");
+  LOG_PATH = path.join(userData, "soft-trainer-logs.json");
+  UPDATE_STATE_PATH = path.join(userData, "soft-trainer-update-state.json");
 }
-function readLogs() {
+function loadLogCache() {
+  if (logCache !== null) return logCache;
   try {
-    const raw = fs.readFileSync(getLogPath(), "utf-8");
-    const all = JSON.parse(raw);
+    const all = JSON.parse(fs.readFileSync(LOG_PATH, "utf-8"));
     const cutoff = Date.now() - LOG_RETENTION_MS;
-    return all.filter((e) => new Date(e.timestamp).getTime() > cutoff);
+    logCache = all.filter((e) => new Date(e.timestamp).getTime() > cutoff);
   } catch {
-    return [];
+    logCache = [];
+  }
+  return logCache;
+}
+function flushLogs() {
+  if (!logCache) return;
+  try {
+    fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true });
+    fs.writeFileSync(LOG_PATH, JSON.stringify(logCache, null, 2));
+  } catch {
   }
 }
-function writeLogs(logs) {
-  try {
-    fs.mkdirSync(electron.app.getPath("userData"), { recursive: true });
-    fs.writeFileSync(getLogPath(), JSON.stringify(logs, null, 2));
-  } catch {
-  }
+function scheduleLogFlush() {
+  if (logFlushTimer) return;
+  logFlushTimer = setTimeout(() => {
+    logFlushTimer = null;
+    flushLogs();
+  }, LOG_FLUSH_DELAY_MS);
 }
 function appendLog(entry) {
-  const logs = readLogs();
+  const logs = loadLogCache();
   const newEntry = {
     ...entry,
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
     timestamp: (/* @__PURE__ */ new Date()).toISOString()
   };
   logs.push(newEntry);
-  writeLogs(logs);
+  scheduleLogFlush();
   return newEntry;
 }
 function parseServices(output) {
-  const lines = output.trim().split("\n").slice(1);
-  return lines.filter((l) => l.trim()).map((line) => {
+  return output.trim().split("\n").slice(1).filter((l) => l.trim()).map((line) => {
     const parts = line.trim().split(/\s+/);
     return { name: parts[0] ?? "", status: parts[1] ?? "none", user: parts[2] ?? "-" };
   }).filter((s) => s.name);
@@ -113,17 +122,16 @@ async function detectActiveVersion(name) {
   if (!cmd) return null;
   try {
     const { stdout } = await runCmd(cmd, { timeout: 5e3 });
-    const match = stdout.match(/(\d+\.\d+[\.\d]*)/)?.[1];
-    return match ?? null;
+    return stdout.match(/(\d+\.\d+[\.\d]*)/)?.[1] ?? null;
   } catch {
     return null;
   }
 }
 async function getPyenvModules() {
   try {
-    const { stdout: versionsOut } = await runCmd(`"${PYENV}" versions --bare 2>/dev/null`, { timeout: 5e3 });
-    const versions = versionsOut.trim().split("\n").map((v) => v.trim()).filter(Boolean);
-    if (versions.length === 0) return [];
+    const { stdout } = await runCmd(`"${PYENV}" versions --bare 2>/dev/null`, { timeout: 5e3 });
+    const versions = stdout.trim().split("\n").map((v) => v.trim()).filter(Boolean);
+    if (!versions.length) return [];
     let activeVersion = null;
     try {
       const versionFile = `${process.env.HOME}/.pyenv/version`;
@@ -135,8 +143,8 @@ async function getPyenvModules() {
     }
     if (!activeVersion) {
       try {
-        const { stdout: currOut } = await runCmd(`"${PYENV}" version-name 2>/dev/null`, { timeout: 3e3 });
-        activeVersion = currOut.trim().replace("system", "").trim() || null;
+        const { stdout: curr } = await runCmd(`"${PYENV}" version-name 2>/dev/null`, { timeout: 3e3 });
+        activeVersion = curr.trim().replace("system", "").trim() || null;
       } catch {
       }
     }
@@ -156,31 +164,26 @@ async function getNvmModules() {
   try {
     const nvmDir = process.env.NVM_DIR ?? `${process.env.HOME}/.nvm`;
     if (!fs.existsSync(nvmDir)) return [];
-    const { stdout: versionsOut } = await runCmd(
-      `ls "${nvmDir}/versions/node" 2>/dev/null`,
-      { timeout: 5e3 }
-    );
-    const versions = versionsOut.trim().split("\n").map((v) => v.trim().replace(/^v/, "")).filter(Boolean);
-    if (versions.length === 0) return [];
+    const { stdout } = await runCmd(`ls "${nvmDir}/versions/node" 2>/dev/null`, { timeout: 5e3 });
+    const versions = stdout.trim().split("\n").map((v) => v.trim().replace(/^v/, "")).filter(Boolean);
+    if (!versions.length) return [];
     let activeVersion = null;
     try {
       const defaultAlias = `${nvmDir}/alias/default`;
       if (fs.existsSync(defaultAlias)) {
-        activeVersion = fs.readFileSync(defaultAlias, "utf-8").trim().replace(/^v/, "") || null;
-        if (activeVersion && !activeVersion.match(/^\d/)) {
-          const aliasFile = `${nvmDir}/alias/${activeVersion}`;
-          if (fs.existsSync(aliasFile)) {
-            activeVersion = fs.readFileSync(aliasFile, "utf-8").trim().replace(/^v/, "") || null;
-          }
+        let alias = fs.readFileSync(defaultAlias, "utf-8").trim().replace(/^v/, "");
+        if (alias && !/^\d/.test(alias)) {
+          const aliasFile = `${nvmDir}/alias/${alias}`;
+          if (fs.existsSync(aliasFile)) alias = fs.readFileSync(aliasFile, "utf-8").trim().replace(/^v/, "");
         }
+        activeVersion = alias || null;
       }
     } catch {
     }
     if (!activeVersion) {
       try {
-        const { stdout } = await runCmd("node --version 2>/dev/null", { timeout: 3e3 });
-        const match = stdout.match(/v?(\d+\.\d+\.\d+)/);
-        activeVersion = match?.[1] ?? null;
+        const { stdout: v } = await runCmd("node --version 2>/dev/null", { timeout: 3e3 });
+        activeVersion = v.match(/v?(\d+\.\d+\.\d+)/)?.[1] ?? null;
       } catch {
       }
     }
@@ -199,67 +202,61 @@ async function getNvmModules() {
 async function getNpmGlobalModules() {
   try {
     const { stdout } = await runCmd("npm list -g --depth=0 --json 2>/dev/null", { timeout: 1e4 });
-    const parsed = JSON.parse(stdout);
-    const deps = parsed.dependencies ?? {};
-    const modules = [];
+    const deps = JSON.parse(stdout).dependencies ?? {};
     const skip = /* @__PURE__ */ new Set(["npm", "corepack"]);
-    for (const [name, info] of Object.entries(deps)) {
-      if (skip.has(name)) continue;
-      modules.push({
-        name,
-        source: "npm",
-        formulae: [name],
-        versions: [info.version ?? "unknown"],
-        activeVersion: info.version ?? null,
-        isMultiVersion: false
-      });
-    }
-    return modules;
+    return Object.entries(deps).filter(([name]) => !skip.has(name)).map(([name, info]) => ({
+      name,
+      source: "npm",
+      formulae: [name],
+      versions: [info.version ?? "unknown"],
+      activeVersion: info.version ?? null,
+      isMultiVersion: false
+    }));
   } catch {
     return [];
   }
 }
+const KNOWN_PIP_CLIS = /* @__PURE__ */ new Set([
+  "awscli",
+  "ansible",
+  "black",
+  "flake8",
+  "mypy",
+  "pylint",
+  "poetry",
+  "pipenv",
+  "httpie",
+  "youtube-dl",
+  "yt-dlp",
+  "cookiecutter",
+  "pre-commit",
+  "tox",
+  "pytest",
+  "virtualenv",
+  "twine",
+  "build",
+  "setuptools",
+  "wheel",
+  "ipython",
+  "jupyter",
+  "pandas",
+  "numpy",
+  "requests",
+  "flask",
+  "django",
+  "fastapi",
+  "uvicorn",
+  "gunicorn",
+  "celery",
+  "redis",
+  "boto3",
+  "paramiko"
+]);
 async function getPipModules() {
   try {
     const { stdout } = await runCmd("pip3 list --format=json 2>/dev/null", { timeout: 1e4 });
     const packages = JSON.parse(stdout);
-    const knownClis = /* @__PURE__ */ new Set([
-      "awscli",
-      "ansible",
-      "black",
-      "flake8",
-      "mypy",
-      "pylint",
-      "poetry",
-      "pipenv",
-      "httpie",
-      "youtube-dl",
-      "yt-dlp",
-      "cookiecutter",
-      "pre-commit",
-      "tox",
-      "pytest",
-      "virtualenv",
-      "twine",
-      "build",
-      "setuptools",
-      "wheel",
-      "ipython",
-      "jupyter",
-      "pandas",
-      "numpy",
-      "requests",
-      "flask",
-      "django",
-      "fastapi",
-      "uvicorn",
-      "gunicorn",
-      "celery",
-      "redis",
-      "boto3",
-      "paramiko"
-    ]);
-    return packages.filter((p) => knownClis.has(p.name.toLowerCase())).map((p) => ({
+    return packages.filter((p) => KNOWN_PIP_CLIS.has(p.name.toLowerCase())).map((p) => ({
       name: p.name,
       source: "pip",
       formulae: [p.name],
@@ -272,10 +269,12 @@ async function getPipModules() {
   }
 }
 async function getBrewModules() {
-  const { stdout: versionsOut } = await runCmd(`${BREW} list --formula --versions`, { timeout: 3e4 });
-  const { stdout: svcOut } = await runCmd(`${BREW} services list`, { timeout: 1e4 }).catch(() => ({ stdout: "", stderr: "" }));
+  const [{ stdout: versionsOut }, svcResult] = await Promise.all([
+    runCmd(`${BREW} list --formula --versions`, { timeout: 3e4 }),
+    runCmd(`${BREW} services list`, { timeout: 1e4 }).catch(() => ({ stdout: "", stderr: "" }))
+  ]);
   const serviceBaseNames = new Set(
-    svcOut.trim().split("\n").slice(1).map((l) => l.split(/\s+/)[0]?.split("@")[0]).filter(Boolean)
+    svcResult.stdout.trim().split("\n").slice(1).map((l) => l.split(/\s+/)[0]?.split("@")[0]).filter(Boolean)
   );
   const groups = {};
   for (const line of versionsOut.trim().split("\n").filter(Boolean)) {
@@ -283,38 +282,36 @@ async function getBrewModules() {
     const formula = parts[0];
     const version = parts.slice(1).join(" ") || "unknown";
     const base = formula.split("@")[0];
-    if (!groups[base]) groups[base] = [];
-    groups[base].push({ formula, version });
+    (groups[base] ??= []).push({ formula, version });
   }
-  const modules = [];
-  for (const [base, entries] of Object.entries(groups)) {
-    if (serviceBaseNames.has(base)) continue;
-    const isMulti = entries.length > 1;
-    const activeVersion = await detectActiveVersion(base);
-    modules.push({
+  const bases = Object.keys(groups).filter((b) => !serviceBaseNames.has(b));
+  const activeVersions = await Promise.all(bases.map((b) => detectActiveVersion(b)));
+  return bases.map((base, i) => {
+    const entries = groups[base];
+    return {
       name: base,
       source: "brew",
       formulae: entries.map((e) => e.formula),
       versions: entries.map((e) => e.version),
-      activeVersion,
-      isMultiVersion: isMulti
-    });
-  }
-  return modules.sort((a, b) => a.name.localeCompare(b.name));
+      activeVersion: activeVersions[i],
+      isMultiVersion: entries.length > 1
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name));
 }
 async function getAllModules() {
-  const [brewMods, pyenvMods, nvmMods, npmMods, pipMods] = await Promise.allSettled([
+  const [brewRes, pyenvRes, nvmRes, npmRes, pipRes] = await Promise.allSettled([
     getBrewModules(),
     getPyenvModules(),
     getNvmModules(),
     getNpmGlobalModules(),
     getPipModules()
   ]);
-  const brew = brewMods.status === "fulfilled" ? brewMods.value : [];
-  const pyenv = pyenvMods.status === "fulfilled" ? pyenvMods.value : [];
-  const nvm = nvmMods.status === "fulfilled" ? nvmMods.value : [];
-  const npm = npmMods.status === "fulfilled" ? npmMods.value : [];
-  const pip = pipMods.status === "fulfilled" ? pipMods.value : [];
+  const settled = (r) => r.status === "fulfilled" ? r.value : [];
+  const brew = settled(brewRes);
+  const pyenv = settled(pyenvRes);
+  const nvm = settled(nvmRes);
+  const npm = settled(npmRes);
+  const pip = settled(pipRes);
   const hasPyenv = pyenv.some((m) => m.name === "python");
   const hasNvm = nvm.some((m) => m.name === "node");
   const filteredBrew = brew.filter((m) => {
@@ -367,16 +364,12 @@ Warning: could not write ~/.pyenv/version: ${e}`;
         const [major, minor] = version.split(".");
         const brewPyBin = `${BREW_PREFIX}/opt/${targetFormula}/bin`;
         if (fs.existsSync(brewPyBin)) {
-          await runCmd(
-            `ln -sf "${brewPyBin}/python${major}.${minor ?? ""}" "${BREW_PREFIX}/bin/python3" 2>/dev/null || true`,
-            { timeout: 5e3 }
-          ).catch(() => {
-          });
-          await runCmd(
-            `ln -sf "${brewPyBin}/python${major}.${minor ?? ""}" "${BREW_PREFIX}/bin/python${major}.${minor ?? ""}" 2>/dev/null || true`,
-            { timeout: 5e3 }
-          ).catch(() => {
-          });
+          await Promise.all([
+            runCmd(`ln -sf "${brewPyBin}/python${major}.${minor}" "${BREW_PREFIX}/bin/python3" 2>/dev/null || true`, { timeout: 5e3 }).catch(() => {
+            }),
+            runCmd(`ln -sf "${brewPyBin}/python${major}.${minor}" "${BREW_PREFIX}/bin/python${major}.${minor}" 2>/dev/null || true`, { timeout: 5e3 }).catch(() => {
+            })
+          ]);
         }
       }
       return { success: true, output: stdout || stderr };
@@ -561,18 +554,14 @@ const TOOL_DEFINITIONS = [
 async function detectToolVersion(def) {
   try {
     const { stdout, stderr } = await runCmd(def.checkCmd, { timeout: 8e3 });
-    const out = stdout + stderr;
-    const match = out.match(new RegExp(def.versionRegex));
-    return match?.[1] ?? null;
+    return (stdout + stderr).match(new RegExp(def.versionRegex))?.[1] ?? null;
   } catch {
     if (def.id === "nvm") {
-      const nvmDir = process.env.NVM_DIR ?? `${process.env.HOME}/.nvm`;
-      const nvmFile = `${nvmDir}/nvm.sh`;
+      const nvmFile = `${process.env.NVM_DIR ?? `${process.env.HOME}/.nvm`}/nvm.sh`;
       if (fs.existsSync(nvmFile)) {
         try {
           const { stdout } = await runCmd(`bash -c 'source "${nvmFile}" && nvm --version 2>/dev/null'`, { timeout: 8e3 });
-          const match = stdout.trim().match(/(\d+\.\d+[\.\d]*)/);
-          return match?.[1] ?? "installed";
+          return stdout.trim().match(/(\d+\.\d+[\.\d]*)/)?.[1] ?? "installed";
         } catch {
         }
       }
@@ -609,54 +598,46 @@ async function runToolCmd(cmd) {
 }
 const GITHUB_REPO = "arnoriel/softtrainer";
 const GITHUB_BRANCH = "master";
-function getUpdateStatePath() {
-  return path.join(electron.app.getPath("userData"), "soft-trainer-update-state.json");
-}
 function readUpdateState() {
   try {
-    const raw = fs.readFileSync(getUpdateStatePath(), "utf-8");
-    return JSON.parse(raw);
+    return JSON.parse(fs.readFileSync(UPDATE_STATE_PATH, "utf-8"));
   } catch {
     return null;
   }
 }
 function writeUpdateState(state) {
   try {
-    fs.mkdirSync(electron.app.getPath("userData"), { recursive: true });
-    fs.writeFileSync(getUpdateStatePath(), JSON.stringify(state, null, 2));
+    fs.mkdirSync(path.dirname(UPDATE_STATE_PATH), { recursive: true });
+    fs.writeFileSync(UPDATE_STATE_PATH, JSON.stringify(state, null, 2));
   } catch {
   }
 }
 function fetchGitHubCommit(repo, branch) {
   return new Promise((resolve, reject) => {
-    const url = `https://api.github.com/repos/${repo}/commits/${branch}`;
-    const req = https.get(url, {
-      headers: { "User-Agent": "soft-trainer-app" }
-    }, (res) => {
-      let body = "";
-      res.on("data", (chunk) => {
-        body += chunk;
-      });
-      res.on("end", () => {
-        try {
-          const json = JSON.parse(body);
-          if (json.message) {
-            reject(new Error(`GitHub API: ${json.message}`));
-          } else {
+    const req = https.get(
+      `https://api.github.com/repos/${repo}/commits/${branch}`,
+      { headers: { "User-Agent": "soft-trainer-app" } },
+      (res) => {
+        let body = "";
+        res.on("data", (c) => {
+          body += c;
+        });
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(body);
+            if (json.message) return reject(new Error(`GitHub API: ${json.message}`));
             resolve({
               sha: json.sha,
               date: json.commit?.committer?.date ?? json.commit?.author?.date
             });
+          } catch (e) {
+            reject(e);
           }
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
+        });
+      }
+    );
     req.on("error", reject);
-    req.setTimeout(15e3, () => {
-      req.destroy(new Error("Request timed out"));
-    });
+    req.setTimeout(15e3, () => req.destroy(new Error("Request timed out")));
   });
 }
 async function checkForUpdates() {
@@ -668,9 +649,8 @@ async function checkForUpdates() {
       writeUpdateState({ lastKnownCommit: sha });
       return { hasUpdate: false, currentVersion: sha.slice(0, 7), latestCommit: sha, commitDate: date, checkedAt };
     }
-    const hasUpdate = state.lastKnownCommit !== sha;
     return {
-      hasUpdate,
+      hasUpdate: state.lastKnownCommit !== sha,
       currentVersion: state.lastKnownCommit.slice(0, 7),
       latestCommit: sha,
       commitDate: date,
@@ -685,22 +665,25 @@ function sendProgress(phase, pct) {
 }
 function fetchGitHubRelease(repo) {
   return new Promise((resolve, reject) => {
-    const url = `https://api.github.com/repos/${repo}/releases/latest`;
-    const req = https.get(url, { headers: { "User-Agent": "soft-trainer-app" } }, (res) => {
-      let body = "";
-      res.on("data", (c) => {
-        body += c;
-      });
-      res.on("end", () => {
-        try {
-          const json = JSON.parse(body);
-          if (json.message) return reject(new Error(`GitHub Releases API: ${json.message}`));
-          resolve(json.assets ?? []);
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
+    const req = https.get(
+      `https://api.github.com/repos/${repo}/releases/latest`,
+      { headers: { "User-Agent": "soft-trainer-app" } },
+      (res) => {
+        let body = "";
+        res.on("data", (c) => {
+          body += c;
+        });
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(body);
+            if (json.message) return reject(new Error(`GitHub Releases API: ${json.message}`));
+            resolve(json.assets ?? []);
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
     req.on("error", reject);
     req.setTimeout(15e3, () => req.destroy(new Error("Request timed out")));
   });
@@ -711,7 +694,7 @@ function downloadFile(url, destPath) {
       if (redirects > 10) return reject(new Error("Too many redirects"));
       const mod = currentUrl.startsWith("https") ? https : http;
       const req = mod.get(currentUrl, { headers: { "User-Agent": "soft-trainer-app" } }, (res) => {
-        if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) {
+        if ([301, 302, 307, 308].includes(res.statusCode)) {
           if (res.headers.location) return follow(res.headers.location, redirects + 1);
           return reject(new Error("Redirect with no location"));
         }
@@ -740,10 +723,12 @@ function downloadFile(url, destPath) {
     follow(url);
   });
 }
+let cachedInstallPath = void 0;
 function getAppInstallPath() {
+  if (cachedInstallPath !== void 0) return cachedInstallPath;
   const match = process.execPath.match(/^(.*\.app)\//);
-  if (match) return match[1];
-  return null;
+  cachedInstallPath = match ? match[1] : null;
+  return cachedInstallPath;
 }
 async function downloadAndInstall(latestCommit) {
   const dmgPath = path.join(os.tmpdir(), `soft-trainer-update-${Date.now()}.dmg`);
@@ -752,17 +737,14 @@ async function downloadAndInstall(latestCommit) {
     sendProgress("Fetching release info", 5);
     const assets = await fetchGitHubRelease(GITHUB_REPO);
     const arch = process.arch;
-    const asset = assets.find(
-      (a) => a.name.endsWith(".dmg") && a.name.includes(arch)
-    ) ?? assets.find((a) => a.name.endsWith(".dmg"));
-    if (!asset) throw new Error("No DMG asset found in latest GitHub Release. Make sure you have uploaded a .dmg to the release.");
+    const asset = assets.find((a) => a.name.endsWith(".dmg") && a.name.includes(arch)) ?? assets.find((a) => a.name.endsWith(".dmg"));
+    if (!asset) throw new Error("No DMG asset found in latest GitHub Release.");
     sendProgress("Downloading", 10);
     await downloadFile(asset.browser_download_url, dmgPath);
     sendProgress("Mounting DMG", 91);
     const { stdout: attachOut } = await runCmd(`hdiutil attach -nobrowse -quiet "${dmgPath}"`, { timeout: 3e4 });
-    const lines = attachOut.trim().split("\n").filter(Boolean);
-    const lastLine = lines[lines.length - 1];
-    if (!lastLine) throw new Error("hdiutil attach returned no output — DMG may be corrupted or already mounted");
+    const lastLine = attachOut.trim().split("\n").filter(Boolean).pop();
+    if (!lastLine) throw new Error("hdiutil attach returned no output");
     mountPoint = lastLine.split("	").pop()?.trim() ?? null;
     sendProgress("Installing", 94);
     const { stdout: findOut } = await runCmd(`find "${mountPoint}" -maxdepth 1 -name "*.app"`, { timeout: 5e3 });
@@ -770,8 +752,7 @@ async function downloadAndInstall(latestCommit) {
     if (!sourceApp) throw new Error("No .app found inside DMG");
     const installTarget = getAppInstallPath();
     const destDir = installTarget ? path.dirname(installTarget) : "/Applications";
-    const appName = sourceApp.split("/").pop();
-    const destApp = path.join(destDir, appName);
+    const destApp = path.join(destDir, sourceApp.split("/").pop());
     await runCmd(`cp -R "${sourceApp}" "${destApp}"`, { timeout: 3e4 });
     sendProgress("Cleaning up", 98);
     await runCmd(`hdiutil detach "${mountPoint}" -quiet`, { timeout: 15e3 });
@@ -831,7 +812,38 @@ function createWindow() {
     win.loadFile(path.join(__dirname, "../renderer/index.html"));
   }
 }
+function registerServiceAction(action) {
+  const past = action === "restart" ? "restarted" : action === "start" ? "started" : "stopped";
+  electron.ipcMain.handle(`brew:${action}`, async (_, name) => {
+    try {
+      const { stdout, stderr } = await runCmd(`${BREW} services ${action} ${name}`);
+      appendLog({ level: "info", action, target: name, message: `Service ${past}: ${name}` });
+      return { success: true, output: stdout || stderr };
+    } catch (e) {
+      const msg = String(e);
+      appendLog({ level: "error", action, target: name, message: `Failed to ${action} ${name}`, details: msg });
+      return { success: false, error: msg };
+    }
+  });
+}
+function registerToolAction(action) {
+  const channel = action === "install" ? "tools:install" : "tools:update";
+  const logAction = `${action}-tool`;
+  const past = action === "install" ? "Installed" : "Updated";
+  electron.ipcMain.handle(channel, async (_, toolId, cmd) => {
+    const result = await runToolCmd(cmd);
+    appendLog({
+      level: result.success ? "info" : "error",
+      action: logAction,
+      target: toolId,
+      message: result.success ? `${past} tool: ${toolId}` : `Failed to ${action} tool: ${toolId}`,
+      details: result.success ? void 0 : result.error
+    });
+    return result;
+  });
+}
 electron.app.whenReady().then(() => {
+  initLogPath();
   electron.ipcMain.handle("brew:list", async () => {
     try {
       const { stdout } = await runCmd(`${BREW} services list`);
@@ -842,39 +854,9 @@ electron.app.whenReady().then(() => {
       return { error: msg };
     }
   });
-  electron.ipcMain.handle("brew:start", async (_, name) => {
-    try {
-      const { stdout, stderr } = await runCmd(`${BREW} services start ${name}`);
-      appendLog({ level: "info", action: "start", target: name, message: `Service started: ${name}` });
-      return { success: true, output: stdout || stderr };
-    } catch (e) {
-      const msg = String(e);
-      appendLog({ level: "error", action: "start", target: name, message: `Failed to start ${name}`, details: msg });
-      return { success: false, error: msg };
-    }
-  });
-  electron.ipcMain.handle("brew:stop", async (_, name) => {
-    try {
-      const { stdout, stderr } = await runCmd(`${BREW} services stop ${name}`);
-      appendLog({ level: "info", action: "stop", target: name, message: `Service stopped: ${name}` });
-      return { success: true, output: stdout || stderr };
-    } catch (e) {
-      const msg = String(e);
-      appendLog({ level: "error", action: "stop", target: name, message: `Failed to stop ${name}`, details: msg });
-      return { success: false, error: msg };
-    }
-  });
-  electron.ipcMain.handle("brew:restart", async (_, name) => {
-    try {
-      const { stdout, stderr } = await runCmd(`${BREW} services restart ${name}`);
-      appendLog({ level: "info", action: "restart", target: name, message: `Service restarted: ${name}` });
-      return { success: true, output: stdout || stderr };
-    } catch (e) {
-      const msg = String(e);
-      appendLog({ level: "error", action: "restart", target: name, message: `Failed to restart ${name}`, details: msg });
-      return { success: false, error: msg };
-    }
-  });
+  registerServiceAction("start");
+  registerServiceAction("stop");
+  registerServiceAction("restart");
   electron.ipcMain.handle("brew:install", async (_, name) => {
     try {
       const { stdout, stderr } = await runCmd(`${BREW} install ${name}`, { timeout: 18e4 });
@@ -910,11 +892,13 @@ electron.app.whenReady().then(() => {
   electron.ipcMain.handle("brew:switch-version", async (_, source, name, targetFormula, currentFormula) => {
     try {
       const result = await switchVersion(source, name, targetFormula, currentFormula);
-      if (result.success) {
-        appendLog({ level: "info", action: "switch-version", target: targetFormula, message: `Switched ${name} to ${targetFormula}` });
-      } else {
-        appendLog({ level: "error", action: "switch-version", target: targetFormula, message: `Version switch failed: ${targetFormula}`, details: result.error });
-      }
+      appendLog({
+        level: result.success ? "info" : "error",
+        action: "switch-version",
+        target: targetFormula,
+        message: result.success ? `Switched ${name} to ${targetFormula}` : `Version switch failed: ${targetFormula}`,
+        details: result.error
+      });
       return result;
     } catch (e) {
       const msg = String(e);
@@ -932,60 +916,287 @@ electron.app.whenReady().then(() => {
       return { error: msg };
     }
   });
-  electron.ipcMain.handle("tools:install", async (_, toolId, cmd) => {
-    try {
-      const result = await runToolCmd(cmd);
-      if (result.success) {
-        appendLog({ level: "info", action: "install-tool", target: toolId, message: `Installed tool: ${toolId}` });
-      } else {
-        appendLog({ level: "error", action: "install-tool", target: toolId, message: `Failed to install tool: ${toolId}`, details: result.error });
-      }
-      return result;
-    } catch (e) {
-      const msg = String(e);
-      return { success: false, error: msg };
-    }
-  });
-  electron.ipcMain.handle("tools:update", async (_, toolId, cmd) => {
-    try {
-      const result = await runToolCmd(cmd);
-      if (result.success) {
-        appendLog({ level: "info", action: "update-tool", target: toolId, message: `Updated tool: ${toolId}` });
-      } else {
-        appendLog({ level: "error", action: "update-tool", target: toolId, message: `Failed to update tool: ${toolId}`, details: result.error });
-      }
-      return result;
-    } catch (e) {
-      const msg = String(e);
-      return { success: false, error: msg };
-    }
-  });
-  electron.ipcMain.handle("theme:get-system", () => {
-    return { isDark: electron.nativeTheme.shouldUseDarkColors };
-  });
+  registerToolAction("install");
+  registerToolAction("update");
+  electron.ipcMain.handle("theme:get-system", () => ({ isDark: electron.nativeTheme.shouldUseDarkColors }));
   electron.ipcMain.handle("logs:get", () => {
-    const logs = readLogs();
-    writeLogs(logs);
-    return { data: logs };
+    return { data: loadLogCache() };
   });
   electron.ipcMain.handle("logs:clear", () => {
-    writeLogs([]);
+    logCache = [];
+    flushLogs();
     return { success: true };
   });
-  electron.ipcMain.handle("updater:check", async () => {
-    return checkForUpdates();
-  });
-  electron.ipcMain.handle("updater:download-install", async (_, latestCommit) => {
-    return downloadAndInstall(latestCommit);
-  });
+  electron.ipcMain.handle("updater:check", async () => checkForUpdates());
+  electron.ipcMain.handle(
+    "updater:download-install",
+    async (_, latestCommit) => downloadAndInstall(latestCommit)
+  );
   electron.ipcMain.handle("updater:restart", () => {
     electron.app.relaunch();
     electron.app.exit(0);
+  });
+  electron.ipcMain.handle("projects:select-folder", async () => {
+    const result = await electron.dialog.showOpenDialog({
+      properties: ["openDirectory"],
+      title: "Choose Project Folder"
+    });
+    if (result.canceled || !result.filePaths[0]) return {};
+    return { path: result.filePaths[0] };
+  });
+  electron.ipcMain.handle("projects:list", async (_, dir) => {
+    try {
+      const items = fs.readdirSync(dir).map((name) => {
+        const fullPath = `${dir}/${name}`;
+        try {
+          const stat = fs.statSync(fullPath);
+          const isDir = stat.isDirectory();
+          const isZip = !isDir && name.toLowerCase().endsWith(".zip");
+          if (!isDir && !isZip || name.startsWith(".")) return null;
+          return { name, path: fullPath, type: isDir ? "folder" : "zip", dateMs: stat.mtimeMs };
+        } catch {
+          return null;
+        }
+      }).filter(Boolean);
+      return { items };
+    } catch (e) {
+      return { error: String(e) };
+    }
+  });
+  electron.ipcMain.handle("projects:delete", async (_, path2) => {
+    try {
+      fs.rmSync(path2, { recursive: true, force: true });
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: String(e) };
+    }
+  });
+  electron.ipcMain.handle("projects:duplicate", async (_, srcPath) => {
+    try {
+      const dir = srcPath.substring(0, srcPath.lastIndexOf("/"));
+      const name = srcPath.substring(srcPath.lastIndexOf("/") + 1);
+      let destPath = `${dir}/${name} copy`;
+      let suffix = 2;
+      while (fs.existsSync(destPath)) {
+        destPath = `${dir}/${name} copy ${suffix++}`;
+      }
+      fs.cpSync(srcPath, destPath, { recursive: true });
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: String(e) };
+    }
+  });
+  electron.ipcMain.handle("projects:open-vscode", async (_, path2) => {
+    try {
+      await execAsync(`code "${path2}"`, { timeout: 5e3 }).catch(
+        () => execAsync(`open -a "Visual Studio Code" "${path2}"`, { timeout: 5e3 })
+      );
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: String(e) };
+    }
+  });
+  electron.ipcMain.handle("projects:create-folder", async (_, dir, name) => {
+    try {
+      fs.mkdirSync(`${dir}/${name}`, { recursive: true });
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: String(e) };
+    }
+  });
+  electron.ipcMain.handle("projects:unzip", async (_, zipPath) => {
+    try {
+      const dir = zipPath.substring(0, zipPath.lastIndexOf("/"));
+      const name = zipPath.substring(zipPath.lastIndexOf("/") + 1).replace(/\.zip$/i, "");
+      await runCmd(`unzip -q "${zipPath}" -d "${dir}/${name}"`, { timeout: 3e4 });
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: String(e) };
+    }
+  });
+  electron.ipcMain.handle("projects:detect-tools", async () => {
+    const check = async (cmd) => {
+      try {
+        await runCmd(`which ${cmd}`);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const [npx, npm, yarn, pnpm, bun, composer, pip, pip3, python3, go, cargo, flutter] = await Promise.all([
+      check("npx"),
+      check("npm"),
+      check("yarn"),
+      check("pnpm"),
+      check("bun"),
+      check("composer"),
+      check("pip"),
+      check("pip3"),
+      check("python3"),
+      check("go"),
+      check("cargo"),
+      check("flutter")
+    ]);
+    return { npx, npm, yarn, pnpm, bun, composer, pip, pip3, python3, go, cargo, flutter };
+  });
+  electron.ipcMain.handle("projects:init", async (event, opts) => {
+    const { frameworkId, projectName, targetDir, settings } = opts;
+    const send = (line) => event.sender.send("project:output", line);
+    const env = { ...process.env, PATH: BUILT_PATH };
+    const runStream = (cmd, cwd) => new Promise((resolve) => {
+      send(`$ ${cmd}`);
+      const [bin, ...args] = cmd.split(" ");
+      const proc = child_process.spawn(bin, args, { cwd, env, shell: true });
+      const fwd = (d) => d.toString().split("\n").filter(Boolean).forEach(send);
+      proc.stdout.on("data", fwd);
+      proc.stderr.on("data", fwd);
+      proc.on("close", (code) => resolve(code === 0 ? { success: true } : { success: false, error: `Exit code ${code}` }));
+      proc.on("error", (e) => resolve({ success: false, error: e.message }));
+    });
+    const runExec = async (cmd, cwd) => {
+      send(`$ ${cmd}`);
+      try {
+        const { stdout, stderr } = await execAsync(cmd, { cwd, env, timeout: 12e4 });
+        stdout.split("\n").filter(Boolean).forEach(send);
+        stderr.split("\n").filter(Boolean).forEach(send);
+        return { success: true };
+      } catch (e) {
+        send(`Error: ${e.message}`);
+        return { success: false, error: e.message };
+      }
+    };
+    try {
+      let result;
+      if (frameworkId === "nextjs") {
+        const flags = [
+          settings.typescript ? "--typescript" : "--js",
+          settings.eslint ? "--eslint" : "--no-eslint",
+          settings.tailwind ? "--tailwind" : "--no-tailwind",
+          settings.appRouter ? "--app" : "--no-app",
+          settings.srcDir ? "--src-dir" : "--no-src-dir",
+          "--no-import-alias"
+        ].join(" ");
+        result = await runStream(`npx create-next-app@latest "${projectName}" ${flags}`, targetDir);
+      } else if (frameworkId === "vite-react") {
+        result = await runStream(`npx create-vite@latest "${projectName}" -- --template ${settings.lang ?? "react-ts"}`, targetDir);
+      } else if (frameworkId === "nuxt") {
+        result = await runStream(`npx nuxi@latest init "${projectName}" --packageManager ${settings.packageManager ?? "npm"} --no-gitInit`, targetDir);
+      } else if (frameworkId === "nestjs") {
+        result = await runStream(`npx @nestjs/cli new "${projectName}" --package-manager ${settings.packageManager ?? "npm"} --language TypeScript`, targetDir);
+      } else if (frameworkId === "vite-vanilla") {
+        result = await runStream(`npx create-vite@latest "${projectName}" -- --template ${settings.lang ?? "vanilla-ts"}`, targetDir);
+      } else if (frameworkId === "laravel") {
+        result = await runStream(`composer create-project laravel/laravel "${projectName}"`, targetDir);
+      } else if (frameworkId === "express") {
+        const projectDir = `${targetDir}/${projectName}`;
+        send(`Creating Express project: ${projectName}`);
+        fs.mkdirSync(projectDir, { recursive: true });
+        result = await runExec("npm init -y", projectDir);
+        if (!result.success) return result;
+        const deps = settings.typescript ? "express @types/express typescript ts-node" : "express";
+        result = await runExec(`npm install ${deps}`, projectDir);
+        if (!result.success) return result;
+        if (settings.nodemon) {
+          const devDeps = settings.typescript ? "nodemon ts-node" : "nodemon";
+          await runExec(`npm install --save-dev ${devDeps}`, projectDir);
+        }
+        const ext = settings.typescript ? "ts" : "js";
+        const indexContent = settings.typescript ? `import express, { Request, Response } from 'express'
+
+const app = express()
+const port = process.env.PORT ?? 3000
+
+app.use(express.json())
+
+app.get('/', (req: Request, res: Response) => {
+  res.json({ message: 'Hello from Express!' })
+})
+
+app.listen(port, () => {
+  console.log(\`Server running on http://localhost:\${port}\`)
+})
+` : `const express = require('express')
+
+const app = express()
+const port = process.env.PORT ?? 3000
+
+app.use(express.json())
+
+app.get('/', (req, res) => {
+  res.json({ message: 'Hello from Express!' })
+})
+
+app.listen(port, () => {
+  console.log(\`Server running on http://localhost:\${port}\`)
+})
+`;
+        fs.writeFileSync(`${projectDir}/index.${ext}`, indexContent);
+        send(`✓ Created index.${ext}`);
+        result = { success: true };
+      } else if (frameworkId === "fastapi") {
+        const projectDir = `${targetDir}/${projectName}`;
+        send(`Creating FastAPI project: ${projectName}`);
+        fs.mkdirSync(projectDir, { recursive: true });
+        const packages = settings.sqlalchemy ? "fastapi uvicorn sqlalchemy" : "fastapi uvicorn";
+        if (settings.venv) {
+          result = await runExec("python3 -m venv .venv", projectDir);
+          if (!result.success) return result;
+          result = await runExec(`${projectDir}/.venv/bin/pip install ${packages}`, projectDir);
+        } else {
+          result = await runExec(`pip3 install ${packages}`, projectDir);
+        }
+        if (!result.success) return result;
+        fs.writeFileSync(`${projectDir}/main.py`, `from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"message": "Hello from FastAPI!"}
+`);
+        fs.writeFileSync(`${projectDir}/requirements.txt`, settings.sqlalchemy ? "fastapi\nuvicorn\nsqlalchemy\n" : "fastapi\nuvicorn\n");
+        send("✓ Created main.py and requirements.txt");
+        result = { success: true };
+      } else if (frameworkId === "django") {
+        const projectDir = `${targetDir}/${projectName}`;
+        send(`Creating Django project: ${projectName}`);
+        fs.mkdirSync(projectDir, { recursive: true });
+        if (settings.venv) {
+          result = await runExec("python3 -m venv .venv", projectDir);
+          if (!result.success) return result;
+          result = await runExec(`${projectDir}/.venv/bin/pip install django`, projectDir);
+        } else {
+          result = await runExec("pip3 install django", projectDir);
+        }
+        if (!result.success) return result;
+        const djangoAdmin = settings.venv ? `${projectDir}/.venv/bin/django-admin` : "django-admin";
+        result = await runExec(`${djangoAdmin} startproject config .`, projectDir);
+        if (!result.success) return result;
+        fs.writeFileSync(`${projectDir}/requirements.txt`, "django\n");
+        send("✓ Django project ready");
+      } else {
+        return { success: false, error: `Unknown framework: ${frameworkId}` };
+      }
+      if (result.success) {
+        send(`✓ Done! Project "${projectName}" is ready.`);
+        appendLog({ level: "info", action: "init-project", target: projectName, message: `Created ${frameworkId} project: ${projectName}` });
+      }
+      return result;
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
   });
   createWindow();
   electron.app.on("activate", () => {
     if (electron.BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+electron.app.on("before-quit", () => {
+  if (logFlushTimer) {
+    clearTimeout(logFlushTimer);
+    logFlushTimer = null;
+  }
+  flushLogs();
 });
 electron.app.on("window-all-closed", () => {
   if (process.platform !== "darwin") electron.app.quit();

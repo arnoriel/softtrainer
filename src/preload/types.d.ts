@@ -47,6 +47,19 @@ export interface UpdateInfo {
   error?: string
 }
 
+export interface ProjectItem {
+  name:   string
+  path:   string
+  type:   'folder' | 'zip'
+  dateMs: number
+}
+
+export interface InstalledTools {
+  npx: boolean; npm: boolean; yarn: boolean; pnpm: boolean; bun: boolean
+  composer: boolean; pip: boolean; pip3: boolean; python3: boolean
+  go: boolean; cargo: boolean; flutter: boolean
+}
+
 export interface BrewAPI {
   list:           ()                                                                          => Promise<{ data?: BrewService[]; error?: string }>
   start:          (name: string)                                                              => Promise<{ success: boolean; output?: string; error?: string }>
@@ -68,6 +81,18 @@ export interface BrewAPI {
   restartApp:           ()                     => Promise<void>
   onUpdateProgress:     (cb: (data: { phase: string; pct: number }) => void) => void
   offUpdateProgress:    ()                     => void
+  // Projects
+  selectProjectFolder:  ()                                                            => Promise<{ path?: string }>
+  listProjectItems:     (dir: string)                                                 => Promise<{ items?: ProjectItem[]; error?: string }>
+  deleteProject:        (path: string)                                                => Promise<{ success: boolean; error?: string }>
+  duplicateProject:     (path: string)                                                => Promise<{ success: boolean; error?: string }>
+  openInVSCode:         (path: string)                                                => Promise<{ success: boolean; error?: string }>
+  createProjectFolder:  (dir: string, name: string)                                   => Promise<{ success: boolean; error?: string }>
+  unzipProject:         (path: string)                                                => Promise<{ success: boolean; error?: string }>
+  detectTools:          ()                                                            => Promise<InstalledTools>
+  initProject:          (opts: { frameworkId: string; projectName: string; targetDir: string; settings: Record<string, any> }) => Promise<{ success: boolean; error?: string }>
+  onProjectInitOutput:  (cb: (line: string) => void)                                 => void
+  offProjectInitOutput: ()                                                            => void
 }
 
 declare global {
